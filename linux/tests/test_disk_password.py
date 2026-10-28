@@ -11,6 +11,7 @@ import os
 import pty
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -30,6 +31,15 @@ needs_cryptsetup = pytest.mark.skipif(CRYPTSETUP is None or sys.platform != "lin
 C_ENV = {**os.environ, "LC_ALL": "C", "PATH": f"{Path(CRYPTSETUP).parent}:{os.environ.get('PATH', '')}" if CRYPTSETUP else os.environ.get("PATH", "")}
 
 NO_SUDO_AS_ROOT_EARLY = pytest.mark.skipif(os.geteuid() == 0, reason="as root the root side runs without sudo, where the stand-in steps in")
+
+
+@pytest.fixture(autouse=True)
+def _keep_signal_handlers():
+    """disk_root sets its own SIGINT and SIGQUIT handlers; put the originals back so other tests in the same run are not affected."""
+    saved = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGQUIT)}
+    yield
+    for sig, handler in saved.items():
+        signal.signal(sig, handler)
 
 
 OLD = "old disk pass 1"
@@ -111,7 +121,7 @@ def test_the_cli_refuses_wrong_disk_arguments():
 def test_a_new_password_that_does_not_open_the_disk_is_taken_back(monkeypatch, capsys):
     """luksAddKey said yes, but the new password opens nothing: the old one must stay, the new one go."""
     calls = []
-    monkeypatch.setattr(cli, "cryptsetup", lambda args, key=None, new=None: calls.append((args[0], key)) or subprocess.CompletedProcess(args, 0, b"", b""))
+    monkeypatch.setattr(cli, "cryptsetup", lambda args, key=None, new=None: calls.append((args[0], key)) or subprocess.CompletedProcess(args, 0, b'{"keyslots": {"0": {}}, "tokens": {}}' if args[0] == "luksDump" else b"", b""))
     monkeypatch.setattr(cli, "luks_slot", lambda device, passphrase: 0 if passphrase == OLD else None)
     assert cli.disk_change(["/dev/vda3"], OLD, NEW, False, {"/dev/vda3": 0}) == 1
     # Nothing to take back from a device the new password does not open; the old one is never touched.
@@ -141,6 +151,9 @@ def stand_in_disks(monkeypatch, remove, removes=True):
             if code == 0 and removes:
                 opened[device].discard(NEW)
             return subprocess.CompletedProcess(args, code, b"", b"Device /dev/vda3 is busy.")
+        if args[0] == "luksDump":
+            slots = sorted(slot_of[each] for each in opened[device])
+            return subprocess.CompletedProcess(args, 0, json.dumps({"keyslots": {str(each): {} for each in slots}, "tokens": {}}).encode(), b"")
         return subprocess.CompletedProcess(args, 0, b"", b"")
 
     slot_of = {OLD: 0, NEW: 1}
@@ -484,6 +497,112 @@ def test_ctrl_c_typed_all_through_the_change_never_reaches_cryptsetup(tmp_path, 
     assert all(opens(disk, NEW) and not opens(disk, OLD) for disk in (first, second))
 
 
+@needs_cryptsetup
+@NO_SUDO_AS_ROOT_EARLY
+@pytest.mark.parametrize("burst", [False, True], ids=["once", "every 0.2 s"])
+@pytest.mark.parametrize("sudo", ["stand-in", "real"])
+def test_ctrl_c_at_the_start_of_the_change_stops_cleanly_or_finishes(tmp_path, sudo, burst):
+    """Ctrl+C the moment the command says the change is starting, while sudo and the root side's Python
+    start: either a stop with nothing changed (130) or a change that finishes (0). Never a traceback, a
+    "Fatal Python error", or a change that "ended before it could say how"."""
+    if sudo == "real" and (not shutil.which("sudo") or subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0):
+        pytest.skip("needs sudo without a password, as someone other than root")
+    first, second = make_image(tmp_path / "a.img", OLD), make_image(tmp_path / "b.img", OLD)
+    env = fake_tools(tmp_path / "bin", first, second)
+    answers = list(CHANGE)
+    if sudo == "real":
+        real = shutil.which("sudo")
+        (tmp_path / "bin" / "sudo").write_text(f'#!/bin/sh\n[ "$1" = -v ] && exit 0\nexec {real} "$@"\n')
+        answers = answers[1:]
+    banner = "Keep the computer on until it is done."
+    if burst:
+        code, screen = converse([sys.executable, str(CLI), "password", "--disk"], env, answers, burst_after=banner)
+    else:
+        code, screen = converse([sys.executable, str(CLI), "password", "--disk"], env, [*answers, (banner, b"\x03")])
+    for wrong in ("Traceback", "Fatal Python error", "KeyboardInterrupt", "ended before it could say how"):
+        assert wrong not in screen, (wrong, screen)
+    assert code in (0, 130), screen
+    if code == 130:
+        assert screen.count("stopped. Nothing was changed.") == 1, screen
+        assert all(opens(disk, OLD) and not opens(disk, NEW) for disk in (first, second))
+    else:
+        assert all(opens(disk, NEW) and not opens(disk, OLD) for disk in (first, second))
+
+
+KEPT_DRIVER = """
+import importlib.machinery, importlib.util, signal, sys, termios, time
+loader = importlib.machinery.SourceFileLoader("cli", sys.argv[1])
+cli = importlib.util.module_from_spec(importlib.util.spec_from_loader("cli", loader))
+loader.exec_module(cli)
+cli.SSH_OWN_PROCESS = True
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+before = termios.tcgetattr(0)
+with cli.disk_terminal_kept():
+    kept = termios.tcgetattr(0)[3] & termios.NOFLSH
+    print("ready", flush=True)
+    time.sleep(0.3)
+    sys.stderr.write("the last line\\n")
+    sys.stderr.flush()
+sys.exit(0 if kept and termios.tcgetattr(0) == before else 5)
+"""
+
+
+def test_the_last_line_is_not_lost_to_a_flood_of_ctrl_c():
+    """Each Ctrl+C makes the tty throw away output the terminal has not taken yet, unless NOFLSH is set:
+    typed as fast as the terminal echoes them, they dropped the last line about one time in four. The
+    settings from before come back afterwards."""
+    if not shutil.which("setsid"):
+        pytest.skip("needs setsid (util-linux)")
+    for attempt in range(12):
+        fd, child_end = pty.openpty()
+        process = subprocess.Popen(["setsid", "-c", sys.executable, "-c", KEPT_DRIVER, str(CLI)],
+                                   stdin=child_end, stdout=child_end, stderr=child_end, close_fds=True)
+        os.close(child_end)
+        screen, flooding, deadline = b"", False, time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if flooding:
+                with contextlib.suppress(OSError):
+                    os.write(fd, b"\x03")
+            if not select.select([fd], [], [], 0.02 if flooding else 1)[0]:
+                continue
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            screen += data
+            flooding = flooding or b"ready" in screen
+        code = process.wait(timeout=30)
+        os.close(fd)
+        assert b"the last line" in screen, (attempt, screen[-300:])
+        assert code == 0, "NOFLSH was not set, or the settings from before did not come back"
+
+
+def test_the_terminal_is_left_alone_from_the_background():
+    """Outside the terminal's foreground process group a change of its settings would stop the command
+    (SIGTTOU), so there it does not touch them."""
+    if not shutil.which("setsid"):
+        pytest.skip("needs setsid (util-linux)")
+    driver = KEPT_DRIVER.split("cli.SSH_OWN_PROCESS")[0] + (
+        "import os\n"
+        "child = os.fork()\n"
+        "if child == 0:\n"
+        "    os.setpgid(0, 0)\n"
+        "    with cli.disk_terminal_kept():\n"
+        "        pass\n"
+        "    os._exit(0)\n"
+        "sys.exit(os.waitstatus_to_exitcode(os.waitpid(child, 0)[1]))\n")
+    fd, child_end = pty.openpty()
+    process = subprocess.Popen(["setsid", "-c", sys.executable, "-c", driver, str(CLI)], stdin=child_end, stdout=child_end, stderr=child_end, close_fds=True)
+    os.close(child_end)
+    try:
+        assert process.wait(timeout=20) == 0
+    finally:
+        process.kill()
+        os.close(fd)
+
+
 def add_key(tmp_path: Path, disk: Path, secret: str) -> None:
     old, key = tmp_path / f"{disk.name}.current", tmp_path / f"{disk.name}.added"
     old.write_text(OLD)
@@ -665,14 +784,16 @@ def converse(argv: list[str], env: dict, answers: list[tuple[str, str | bytes]],
     # As root the command asks sudo nothing, so there is no sudo prompt to wait for.
     pending = [answer for answer in answers if not (os.geteuid() == 0 and answer[0].startswith("[sudo]"))]
     screen, deadline = "", time.monotonic() + timeout
-    bursting, sent = False, 0
+    bursting, sent, next_burst = False, 0, 0.0
     while time.monotonic() < deadline:
-        # With burst_after, `burst` is typed every `every` seconds from when that text shows until the end.
-        if bursting:
+        # With burst_after, `burst` is typed every `every` seconds from when that text shows until the end,
+        # on a clock: each one's echo is output too, which must not make the next come sooner.
+        if bursting and time.monotonic() >= next_burst:
             with contextlib.suppress(OSError):
                 os.write(fd, burst)
                 sent += 1
-        ready, _, _ = select.select([fd], [], [], every if bursting else 1)
+            next_burst = time.monotonic() + every
+        ready, _, _ = select.select([fd], [], [], max(0.0, next_burst - time.monotonic()) if bursting else 1)
         if ready:
             try:
                 data = os.read(fd, 4096)
@@ -687,9 +808,18 @@ def converse(argv: list[str], env: dict, answers: list[tuple[str, str | bytes]],
                 answer = pending.pop(0)[1]
                 os.write(fd, answer if isinstance(answer, bytes) else f"{answer}\n".encode())
     code = process.wait(timeout=max(1.0, deadline - time.monotonic()))
+    # Whatever is still on its way after the exit, up to the end of the terminal's output.
+    while select.select([fd], [], [], 0.5)[0]:
+        try:
+            data = os.read(fd, 4096)
+        except OSError:
+            break
+        if not data:
+            break
+        screen += data.decode(errors="replace")
     os.close(fd)
     if burst_after:
-        assert sent > 3, f"only {sent} bursts were typed"
+        assert sent >= 1, "no burst was typed"
     return code, screen
 
 
@@ -866,7 +996,7 @@ def test_ctrl_c_before_the_change_begins_does_not_say_it_is_still_changing(tmp_p
 
 def test_a_root_side_that_was_killed_is_looked_at_and_the_end_state_said(monkeypatch, capsys):
     state = {"/dev/vda3": {"current": True, "new": True}, "/dev/vdb1": {"current": True, "new": False}}
-    argv = {"change": ["sh", "-c", "kill -9 $$"], "probe": [sys.executable, "-c", f"import sys; sys.stdin.read(); print({json.dumps(json.dumps(state))})"]}
+    argv = {"change": ["sh", "-c", "cat >/dev/null; echo 'Adding the new disk password to /dev/vda3…'; kill -9 $$"], "probe": [sys.executable, "-c", f"import sys; sys.stdin.read(); print({json.dumps(json.dumps(state))})"]}
     monkeypatch.setattr(cli, "disk_root_argv", lambda op: argv[op])
     assert cli.disk_helper("change", {"devices": list(state), "current": OLD, "new": NEW}) == cli.DISK_PARTLY
     err = capsys.readouterr().err
@@ -875,11 +1005,12 @@ def test_a_root_side_that_was_killed_is_looked_at_and_the_end_state_said(monkeyp
     assert "/dev/vdb1: the current disk password opens it, the new one does not" in err
 
 
-@pytest.mark.parametrize("code", [1, 6, -2])
+@pytest.mark.parametrize("code", [1, 6, -15])
 def test_a_failure_of_sudo_after_the_change_was_done_is_not_the_change_s(monkeypatch, capsys, code):
     """The root side says the change is done, then sudo ends with a failure of its own (as with "sudo: :
     Broken pipe" when Ctrl+C lands at that moment): the change is done, so exit 0, and it says why."""
-    stand_in = f"cat >/dev/null; echo '{cli.DISK_CHANGE_DONE}'; " + ("kill -INT $$" if code < 0 else f"exit {code}")
+    # A signal the root side does not start with ignored (it starts with SIGINT and SIGQUIT ignored).
+    stand_in = f"cat >/dev/null; echo '{cli.DISK_CHANGE_DONE}'; " + ("kill -TERM $$" if code < 0 else f"exit {code}")
     monkeypatch.setattr(cli, "disk_root_argv", lambda op: ["sh", "-c", stand_in] if op == "change" else ["false"])
     assert cli.disk_helper("change", {"devices": ["/dev/vda3"], "current": OLD, "new": NEW}) == 0
     assert f"sudo ended with exit {code} after the change was done" in capsys.readouterr().err
@@ -892,7 +1023,7 @@ def test_a_failure_without_done_is_still_the_change_s(monkeypatch, capsys):
 
 
 def test_when_even_looking_fails_it_says_what_is_sure(monkeypatch, capsys):
-    monkeypatch.setattr(cli, "disk_root_argv", lambda op: ["sh", "-c", "kill -9 $$"] if op == "change" else ["false"])
+    monkeypatch.setattr(cli, "disk_root_argv", lambda op: ["sh", "-c", "cat >/dev/null; echo 'Adding the new disk password to /dev/vda3…'; kill -9 $$"] if op == "change" else ["false"])
     assert cli.disk_helper("change", {"devices": ["/dev/vda3"], "current": OLD, "new": NEW}) == cli.DISK_PARTLY
     said = capsys.readouterr().err
     assert "may have ended before anything changed, or part-way" in said and "the current one or the new one (or both) opens each" in said
@@ -938,7 +1069,8 @@ def quiet_cryptsetup(monkeypatch, keyslots: dict[int, str], tokens: dict | None 
         no = subprocess.CompletedProcess(args, 2, b"", b"No key available with this passphrase.")
         slots = header["keyslots"]
         # As an interrupted check does: it may print that a slot opened, then exits 1.
-        interrupted = header.get("interrupt") and header.get("added") and (header["interrupt"] == "all" or key == header["interrupt"])
+        interrupted = (header.get("interrupt") and (header.get("added") or header.get("interrupt_from_start"))
+                       and (header["interrupt"] == "all" or key == header["interrupt"]))
         if args[0] == "open" and interrupted:
             return subprocess.CompletedProcess(args, 1, b"Key slot 0 unlocked.\nCommand failed with code -1 (wrong or missing parameters).\n", b"")
         if args[0] == "open":
@@ -948,12 +1080,21 @@ def quiet_cryptsetup(monkeypatch, keyslots: dict[int, str], tokens: dict | None 
                 return ok if header["named_by_slot"] and key not in header["hidden"] and slots.get(slot) == key else no
             return ok if key in slots.values() else no
         if args[0] == "luksDump":
+            if header.get("added") and header.get("dumps_failing", 0) > 0:
+                header["dumps_failing"] -= 1
+                return subprocess.CompletedProcess(args, 1, b"", b"Device /dev/vda3 is busy.")
             return subprocess.CompletedProcess(args, 0, json.dumps({"keyslots": {str(n): {} for n in slots}, "tokens": header["tokens"]}).encode(), b"")
         if args[0] == "luksAddKey":
             header["added"] = True
             if header.get("add") == "silent failure":
                 if header.get("on_failed_add"):
                     header["on_failed_add"](header)
+                return subprocess.CompletedProcess(args, 1, b"", b"")
+            if header.get("add") == "killed":
+                return subprocess.CompletedProcess(args, -9, b"", b"")
+            if header.get("add") == "wrote another":
+                # A slot appears, but not one the new password opens.
+                slots[min(set(range(32)) - set(slots))] = "not the new one"
                 return subprocess.CompletedProcess(args, 1, b"", b"")
             slots[min(set(range(32)) - set(slots))] = new
             if on_add:
@@ -1142,10 +1283,104 @@ def test_a_failed_add_never_takes_a_slot_that_was_there_for_the_new_one(monkeypa
     header, _ = quiet_cryptsetup(monkeypatch, {0: OLD, 3: "someone else's"}, {"0": token} if token else {})
     header["add"] = "silent failure"
     header["on_failed_add"] = lambda header: header["keyslots"].__setitem__(3, NEW)
-    assert root_side_here(monkeypatch, "change", {"devices": ["/dev/vda3"], "current": OLD, "new": NEW}) == 1
+    # The new password now opens a slot that was there before: it will not do, as at the start (exit 13).
+    assert root_side_here(monkeypatch, "change", {"devices": ["/dev/vda3"], "current": OLD, "new": NEW}) == cli.DISK_NEW_IS_OTHER_KEY
     said = capsys.readouterr().err
     assert "could not be added to /dev/vda3" in said and "going on" not in said
+    assert "it now opens key slot 3 of /dev/vda3, which was there before: choose another one" in said
     assert header["keyslots"] == {0: OLD, 3: NEW}
+
+
+def test_a_failed_add_whose_slot_is_seen_only_after_a_failed_read_is_taken_back(monkeypatch, capsys):
+    """The add writes slot 1 and exits 1, and the header cannot be read just after it, so the look for
+    new slots sees none. Slot 1 then opens with the new password, but it was not in the header from
+    before: this add's, taken back, never "there before" (exit 13)."""
+    header, _ = quiet_cryptsetup(monkeypatch, {0: OLD})
+    header["add"] = "interrupted"
+    header["dumps_failing"] = 1
+    assert root_side_here(monkeypatch, "change", {"devices": ["/dev/vda3"], "current": OLD, "new": NEW}) == 1
+    said = capsys.readouterr().err
+    assert "could not be added to /dev/vda3" in said and "which was there before" not in said and "going on" not in said
+    assert header["keyslots"] == {0: OLD}
+
+
+def test_a_failed_add_that_wrote_a_slot_the_new_password_does_not_open_is_not_taken(monkeypatch, capsys):
+    """A slot appeared, but the new password does not open it on its own (--key-slot): not taken for the
+    add, so nothing goes on to remove the old password."""
+    header, _ = quiet_cryptsetup(monkeypatch, {0: OLD})
+    header["add"] = "wrote another"
+    assert root_side_here(monkeypatch, "change", {"devices": ["/dev/vda3"], "current": OLD, "new": NEW}) == 1
+    said = capsys.readouterr().err
+    assert "going on" not in said and "could not be added to /dev/vda3" in said
+    assert header["keyslots"][0] == OLD
+
+
+def test_an_unreadable_header_before_the_add_means_no_add(monkeypatch, capsys):
+    """Without the slot numbers from before, a slot the add wrote could not be told from one that was
+    there (the recovery key's, say): no luksAddKey at all, and nothing changes."""
+    header, _ = quiet_cryptsetup(monkeypatch, {0: OLD, 3: NEW}, {"0": {"type": "systemd-recovery", "keyslots": ["3"]}})
+    header["keyslots"][3] = "someone else's"
+    real = cli.cryptsetup
+    calls = []
+    monkeypatch.setattr(cli, "cryptsetup", lambda args, key=None, new=None: calls.append(args[0]) or real(args, key, new))
+    monkeypatch.setattr(cli, "luks_slot_numbers", lambda device: None)
+    assert root_side_here(monkeypatch, "change", {"devices": ["/dev/vda3"], "current": OLD, "new": NEW}) == 1
+    said = capsys.readouterr().err
+    assert "the key slots of /dev/vda3 could not be read before adding the new disk password" in said and "nothing was changed" in said
+    assert "luksAddKey" not in calls and header["keyslots"] == {0: OLD, 3: "someone else's"}
+
+
+def test_an_add_stopped_by_a_signal_says_so_and_not_ctrl_c(monkeypatch, capsys):
+    header, _ = quiet_cryptsetup(monkeypatch, {0: OLD})
+    header["add"] = "killed"
+    assert root_side_here(monkeypatch, "change", {"devices": ["/dev/vda3"], "current": OLD, "new": NEW}) == 1
+    said = capsys.readouterr().err
+    assert "could not be added to /dev/vda3: cryptsetup was stopped by signal 9" in said and "Ctrl+C" not in said
+
+
+@pytest.mark.parametrize("op", ["check", "change"])
+def test_an_unclear_check_of_the_current_password_changes_nothing(monkeypatch, capsys, op):
+    """cryptsetup gives no answer for the current password: refused with exit 1 and "Nothing was
+    changed", never taken for "not the disk password" or for an answer."""
+    header, _ = quiet_cryptsetup(monkeypatch, {0: OLD})
+    header["interrupt"], header["interrupt_from_start"] = OLD, True
+    assert root_side_here(monkeypatch, op, {"devices": ["/dev/vda3"], "current": OLD, "new": NEW}) == 1
+    said = capsys.readouterr().err
+    assert "could not tell whether a password opens /dev/vda3" in said and "Nothing was changed." in said
+    assert "not the disk password" not in said and header["keyslots"] == {0: OLD}
+
+
+def test_an_unclear_answer_in_the_scan_for_a_leftover_says_nothing_was_changed(monkeypatch, capsys):
+    """The scan for an earlier run's leftover gets no answer for the new password: nothing has been
+    written, so "Nothing was changed", not "maybe part-way"."""
+    header, _ = quiet_cryptsetup(monkeypatch, {0: OLD})
+    header["interrupt"], header["interrupt_from_start"] = NEW, True
+    assert root_side_here(monkeypatch, "change", {"devices": ["/dev/vda3"], "current": OLD, "new": NEW}) == 1
+    said = capsys.readouterr().err
+    assert "Nothing was changed." in said and "part-way" not in said and header["keyslots"] == {0: OLD}
+
+
+def test_a_timeout_before_the_add_says_nothing_was_changed(monkeypatch, capsys):
+    header, _ = quiet_cryptsetup(monkeypatch, {0: OLD})
+    real = cli.cryptsetup
+
+    def slow_for_the_new_one(args, key=None, new=None):
+        if args[0] == "open" and key == NEW:
+            raise subprocess.TimeoutExpired(["cryptsetup", "open"], 300)
+        return real(args, key, new)
+
+    monkeypatch.setattr(cli, "cryptsetup", slow_for_the_new_one)
+    assert root_side_here(monkeypatch, "change", {"devices": ["/dev/vda3"], "current": OLD, "new": NEW}) == 1
+    said = capsys.readouterr().err
+    assert "did not finish in 300 s (open) and was stopped. Nothing was changed." in said and "part-way" not in said
+
+
+def test_a_new_owner_s_kill_that_says_it_failed_but_removed_the_slot_finishes(monkeypatch, capsys):
+    header, _ = quiet_cryptsetup(monkeypatch, {0: OLD, 2: "someone else's"})
+    header["kill"] = "interrupted"
+    assert root_side_here(monkeypatch, "change", {"devices": ["/dev/vda3"], "current": OLD, "new": NEW, "newOwner": True}) == 0
+    assert "could not be removed" not in capsys.readouterr().err
+    assert list(header["keyslots"].values()) == [NEW]
 
 
 def test_a_new_slot_a_token_uses_is_not_taken_for_the_add(monkeypatch, capsys):
@@ -1265,6 +1500,179 @@ def test_draining_stops_when_the_pipe_stays_open(tmp_path):
     cli.disk_drain(os.fdopen(read, "rb"), None, wait=0.3)
     os.close(write)
     assert time.monotonic() - started < 2
+
+
+def test_an_unclear_look_is_not_taken_for_does_not_open(monkeypatch):
+    """The look after a killed root side: cryptsetup gives no answer for one password, which is "could not
+    be checked", never False ("does not open")."""
+    def slot(device, passphrase):
+        if passphrase == NEW:
+            raise cli.LuksUnsure("cryptsetup could not tell whether a password opens /dev/vda3 (cryptsetup exited 1)")
+        return 0
+    monkeypatch.setattr(cli, "luks_slot", slot)
+    state = cli.disk_probe(["/dev/vda3"], OLD, NEW)
+    assert state == {"/dev/vda3": {"current": True, "new": None}}
+    assert cli.disk_end_lines(state) == ["/dev/vda3: it could not be checked; try the new disk password first, then the current one"]
+
+
+def test_the_look_holds_its_signals_and_runs_cryptsetup_in_a_session_of_its_own(monkeypatch, capsys):
+    seen = []
+    monkeypatch.setattr(cli, "luks_slot", lambda device, passphrase: seen.append((cli.CRYPTSETUP_OWN_SESSION["on"], signal.getsignal(signal.SIGINT))) or 0)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/sbin/{name}")
+    before = signal.getsignal(signal.SIGINT)
+    assert root_side_here(monkeypatch, "probe", {"devices": ["/dev/vda3"], "current": OLD, "new": NEW}) == 0
+    # SIG_IGN, not a Python handler: a child keeps it through the moment between fork and setsid.
+    assert seen and all(own and handler == signal.SIG_IGN for own, handler in seen)
+    assert signal.getsignal(signal.SIGINT) == before
+
+
+def test_the_root_side_takes_ctrl_c_as_a_stop_only_for_the_check_and_the_change(monkeypatch):
+    """It is started with SIGINT and SIGQUIT ignored; check and change turn them into a stop (exit 130
+    before the change), the probe leaves them ignored."""
+    got = {}
+    monkeypatch.setattr(cli, "disk_root_op", lambda args: got.setdefault(args[0], (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGQUIT))) and 0)
+    before = {each: signal.getsignal(each) for each in (signal.SIGINT, signal.SIGQUIT)}
+    try:
+        for op in ("check", "change", "probe"):
+            for each in before:
+                signal.signal(each, signal.SIG_IGN)
+            cli.disk_root([op])
+    finally:
+        for each, handler in before.items():
+            signal.signal(each, handler)
+    assert got["check"] == got["change"] == (cli.disk_stop, cli.disk_stop)
+    assert got["probe"] == (signal.SIG_IGN, signal.SIG_IGN)
+
+
+def test_a_noted_ctrl_c_stops_after_the_next_cryptsetup_and_before_the_hold(monkeypatch):
+    """Noted where it lands, then a stop at the next cryptsetup call or when the change would begin, and
+    nothing once the change holds its signals."""
+    monkeypatch.setitem(cli.DISK_STOPPED, "yes", False)
+    monkeypatch.setattr(cli, "cryptsetup_run", lambda *a: subprocess.CompletedProcess(a, 0, b"", b""))
+    cli.cryptsetup(["isLuks", "/dev/vda3"])
+    cli.disk_stop(signal.SIGINT, None)
+    with pytest.raises(KeyboardInterrupt):
+        cli.cryptsetup(["isLuks", "/dev/vda3"])
+    before = signal.getsignal(signal.SIGINT)
+    with pytest.raises(KeyboardInterrupt):
+        with cli.disk_signals_held():
+            pytest.fail("the change began after a Ctrl+C")
+    assert signal.getsignal(signal.SIGINT) == before and not cli.CRYPTSETUP_OWN_SESSION["on"]
+    monkeypatch.setitem(cli.CRYPTSETUP_OWN_SESSION, "on", True)
+    cli.cryptsetup(["luksDump", "/dev/vda3"])
+
+
+STARTED_WITH = """
+import importlib.machinery, importlib.util, signal, sys
+loader = importlib.machinery.SourceFileLoader("cli", sys.argv[1])
+cli = importlib.util.module_from_spec(importlib.util.spec_from_loader("cli", loader))
+loader.exec_module(cli)
+show = "import signal, sys; sys.stdin.read(); print('ignored', signal.getsignal(signal.SIGINT) == signal.SIG_IGN, signal.getsignal(signal.SIGQUIT) == signal.SIG_IGN, flush=True)"
+cli.disk_root_argv = lambda op: [sys.executable, "-c", show]
+cli.disk_helper(sys.argv[2], {"devices": ["/dev/vda3"], "current": "x", "new": "y"})
+print("after", signal.getsignal(signal.SIGINT) == signal.default_int_handler, flush=True)
+"""
+
+
+@pytest.mark.parametrize("op", ["check", "change"])
+def test_the_root_side_starts_with_ctrl_c_ignored(op):
+    """So a Ctrl+C while sudo and Python start cannot reach it half-started: no traceback, no "Fatal Python
+    error", no death that would read as a change ended without saying."""
+    result = subprocess.run([sys.executable, "-c", STARTED_WITH, str(CLI), op], capture_output=True, text=True, timeout=30)
+    assert "ignored True True" in result.stdout, result
+    if op == "check":
+        assert "after True" in result.stdout, "the person's side keeps its own handler"
+
+
+@pytest.mark.parametrize("death", ["kill -TERM $$", "kill -HUP $$", "kill -9 $$", "exit 134"])
+def test_a_root_side_that_dies_before_it_starts_changing_changed_nothing(monkeypatch, capsys, death):
+    """Before it says it is adding the new password, nothing is written: a death by a signal there is a
+    stop (130, which the command answers with "stopped. Nothing was changed."), never a look for a change
+    that ended part-way."""
+    looked = []
+    argv = {"change": ["sh", "-c", f"cat >/dev/null; {death}"], "probe": ["sh", "-c", "echo looked"]}
+    monkeypatch.setattr(cli, "disk_root_argv", lambda op: looked.append(op) or argv[op])
+    assert cli.disk_helper("change", {"devices": ["/dev/vda3"], "current": OLD, "new": NEW}) == 130
+    assert "probe" not in looked and "ended before it could say how" not in capsys.readouterr().err
+
+
+def test_a_root_side_that_ends_oddly_before_it_starts_changing_says_nothing_was_changed(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "disk_root_argv", lambda op: ["sh", "-c", "cat >/dev/null; exit 42"])
+    assert cli.disk_helper("change", {"devices": ["/dev/vda3"], "current": OLD, "new": NEW}) == 1
+    assert "ended (exit 42) before it changed anything. Nothing was changed." in capsys.readouterr().err
+
+
+AFTER_DONE_DRIVER = """
+import importlib.machinery, importlib.util, os, signal, sys, threading
+loader = importlib.machinery.SourceFileLoader("cli", sys.argv[1])
+cli = importlib.util.module_from_spec(importlib.util.spec_from_loader("cli", loader))
+loader.exec_module(cli)
+cli.disk_root_argv = lambda op: ["sh", "-c", "cat >/dev/null; echo 'Adding the new disk password to /dev/vda3…'; echo '" + cli.DISK_CHANGE_DONE + "'; sleep 0.8; exit 0"]
+threading.Timer(0.4, lambda: os.kill(os.getpid(), signal.SIGINT)).start()
+print("code", cli.disk_helper("change", {"devices": ["/dev/vda3"], "current": "x", "new": "y"}), flush=True)
+"""
+
+
+def test_a_ctrl_c_after_done_does_not_say_it_is_still_changing():
+    result = subprocess.run([sys.executable, "-c", AFTER_DONE_DRIVER, str(CLI)], capture_output=True, text=True, timeout=30)
+    assert "code 0" in result.stdout and "Done" in result.stdout, result
+    assert "still changing" not in result.stderr
+
+
+def test_a_ctrl_c_just_before_the_change_starts_is_a_stop_with_one_message(monkeypatch, capsys):
+    """Between the last answer and disk_helper_change holding Ctrl+C: the command stops with exit 130 and
+    says "stopped. Nothing was changed." once, without a traceback."""
+    monkeypatch.setattr(cli, "disk_devices", lambda: ["/dev/vda3"])
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.os, "geteuid", lambda: 0)
+    answers = iter([OLD, NEW, NEW])
+    monkeypatch.setattr(cli, "disk_ask", lambda prompt: next(answers))
+
+    def helper(op, request):
+        if op == "change":
+            raise KeyboardInterrupt
+        return 0
+
+    monkeypatch.setattr(cli, "disk_helper", helper)
+    monkeypatch.setattr(cli, "SSH_OWN_PROCESS", True)
+    with pytest.raises(SystemExit) as stop:
+        cli.disk_password([])
+    assert stop.value.code == 130
+    said = capsys.readouterr().err
+    assert said.count("stopped. Nothing was changed.") == 1 and "Traceback" not in said
+    # Run as its own process, one more Ctrl+C before it exits does nothing.
+    assert signal.getsignal(signal.SIGINT) == signal.getsignal(signal.SIGQUIT) == signal.SIG_IGN
+
+
+@pytest.mark.parametrize("code", [-2, -15])
+def test_a_check_that_ends_by_a_signal_is_a_stop(monkeypatch, capsys, code):
+    """A root side whose check dies by a signal (as when Ctrl+C lands while it starts) only looked: a
+    stop with nothing changed, said once, and no change asked for."""
+    monkeypatch.setattr(cli, "disk_devices", lambda: ["/dev/vda3"])
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(cli, "disk_ask", lambda prompt: OLD)
+    asked = []
+    monkeypatch.setattr(cli, "disk_helper", lambda op, request: asked.append(op) or code)
+    with pytest.raises(SystemExit) as stop:
+        cli.disk_password([])
+    assert stop.value.code == 130 and asked == ["check"]
+    assert capsys.readouterr().err.count("stopped. Nothing was changed.") == 1
+
+
+def test_a_look_that_runs_out_of_time_is_killed_and_said(monkeypatch, tmp_path, capsys):
+    """The look after an odd end has a time limit; past it the root side is killed rather than waited for,
+    and the command says the state could not be checked."""
+    pid_file = tmp_path / "pid"
+    look = f"import os, sys, time; open({str(pid_file)!r}, 'w').write(str(os.getpid())); sys.stdin.read(); time.sleep(30)"
+    monkeypatch.setattr(cli, "disk_root_argv", lambda op: [sys.executable, "-c", look])
+    monkeypatch.setattr(cli, "CRYPTSETUP_TIMEOUT", 0.5)
+    started = time.monotonic()
+    assert cli.disk_report_end({"devices": ["/dev/vda3"], "current": OLD, "new": NEW}, -9) == cli.DISK_PARTLY
+    assert time.monotonic() - started < 10
+    assert "that could not be checked" in capsys.readouterr().err
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)
 
 
 def test_the_end_state_in_words():
